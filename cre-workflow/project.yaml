@@ -1,0 +1,19 @@
+# CRE Project Configuration for Destaker
+# See: https://docs.chain.link/cre/reference/project-configuration-ts
+
+staging-settings:
+  rpcs:
+    - chain-name: ethereum-testnet-sepolia
+      url: https://ethereum-sepolia-rpc.publicnode.com
+    - chain-name: base-testnet-sepolia
+      url: https://sepolia.base.org
+
+production-settings:
+  rpcs:
+    - chain-name: ethereum-mainnet
+      url: https://ethereum-rpc.publicnode.com
+    - chain-name: base-mainnet
+      url: https://mainnet.base.org
+  account:
+    # Workflow owner address (set via CRE CLI)
+    workflow-owner-address: ""

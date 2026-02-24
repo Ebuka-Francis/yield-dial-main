@@ -1,0 +1,19 @@
+project_id = "pgereiuwcgumeacibpee"
+
+[functions.fetch-yields]
+verify_jwt = false
+
+[functions.predict-yield]
+verify_jwt = false
+
+[functions.verify-worldid]
+verify_jwt = false
+
+[functions.batch-predict]
+verify_jwt = false
+
+[functions.worldid-rp-context]
+verify_jwt = false
+
+[functions.cre-workflow-simulate]
+verify_jwt = false

@@ -1,0 +1,15 @@
+# CRE Workflow Configuration: Destaker Settlement
+# This workflow orchestrates yield prediction market settlement
+# using blockchain + DeFiLlama API + Gemini AI
+
+staging-settings:
+  user-workflow:
+    workflow-name: "destaker-settlement-staging"
+    workflow-artifacts:
+      workflow-path: "./main.ts"
+
+production-settings:
+  user-workflow:
+    workflow-name: "destaker-settlement"
+    workflow-artifacts:
+      workflow-path: "./main.ts"
