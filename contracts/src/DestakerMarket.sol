@@ -2,13 +2,15 @@
 pragma solidity ^0.8.24;
 
 import {IWorldID} from "./interfaces/IWorldID.sol";
+import {IReceiver} from "./interfaces/IReceiver.sol";
 
 /// @title DestakerMarket
 /// @notice Sybil-resistant yield prediction markets settled by Chainlink CRE workflows.
-/// @dev Users buy YES/NO outcome shares with USDC. Markets are settled by an authorised
-///      CRE settler address that posts the final APY and outcome. Winners redeem shares 1:1
-///      for USDC from the market pool. World ID verification prevents multi-account abuse.
-contract DestakerMarket {
+/// @dev Users buy YES/NO outcome shares with USDC. Markets are settled either by:
+///      (a) an authorised CRE settler address calling settleMarket() directly, or
+///      (b) the Chainlink Forwarder delivering a DON-signed report via onReport().
+///      Winners redeem shares pro-rata for USDC. World ID verification prevents Sybil abuse.
+contract DestakerMarket is IReceiver {
     // ──────────────────────────────────────────────
     //  Types
     // ──────────────────────────────────────────────
@@ -61,6 +63,9 @@ contract DestakerMarket {
 
     /// @notice Address authorised to settle markets (the CRE workflow DON address).
     address public settler;
+
+    /// @notice Chainlink Forwarder contract that delivers DON-signed reports.
+    address public forwarder;
 
     /// @notice Accumulated protocol fees (in USDC).
     uint256 public accumulatedFees;
@@ -117,6 +122,8 @@ contract DestakerMarket {
     event LiquidityAdded(uint256 indexed marketId, address indexed provider, uint256 amount, uint256 lpShares);
     event LiquidityRemoved(uint256 indexed marketId, address indexed provider, uint256 amount, uint256 lpShares);
     event SettlerUpdated(address indexed oldSettler, address indexed newSettler);
+    event ForwarderUpdated(address indexed oldForwarder, address indexed newForwarder);
+    event SettlementReportReceived(uint256 indexed marketId, Outcome outcome, uint256 finalApyBps);
 
     // ──────────────────────────────────────────────
     //  Errors
@@ -133,6 +140,8 @@ contract DestakerMarket {
     error NothingToClaim();
     error InvalidNullifier();
     error TransferFailed();
+    error InvalidForwarder();
+    error InvalidReportLength();
 
     // ──────────────────────────────────────────────
     //  Modifiers
@@ -202,6 +211,12 @@ contract DestakerMarket {
     function setSettler(address _settler) external onlyOwner {
         emit SettlerUpdated(settler, _settler);
         settler = _settler;
+    }
+
+    /// @notice Update the Chainlink Forwarder address.
+    function setForwarder(address _forwarder) external onlyOwner {
+        emit ForwarderUpdated(forwarder, _forwarder);
+        forwarder = _forwarder;
     }
 
     /// @notice Withdraw accumulated protocol fees.
@@ -317,11 +332,46 @@ contract DestakerMarket {
     }
 
     // ──────────────────────────────────────────────
-    //  Settlement (called by CRE workflow)
+    //  CRE Settlement — IReceiver (production path)
     // ──────────────────────────────────────────────
 
-    /// @notice Settle a market. Only callable by the authorised CRE settler address.
-    ///         This is the on-chain target for `evmClient.write()` in the CRE workflow.
+    /// @notice Called by the Chainlink Forwarder to deliver a DON-signed settlement report.
+    ///         The report is ABI-encoded as a batch of (uint256 marketId, uint8 outcome, uint256 finalApyBps)
+    ///         tuples produced by runtime.report() in the CRE TypeScript workflow.
+    /// @param metadata Workflow metadata (ignored for now — can be used for workflow ID validation).
+    /// @param report   ABI-encoded settlement payload.
+    function onReport(bytes calldata metadata, bytes calldata report) external override {
+        if (msg.sender != forwarder) revert InvalidForwarder();
+        // Silence unused-parameter warning; metadata can be validated in a future version.
+        metadata;
+
+        // Decode a batch of settlements: (uint256 marketId, uint8 outcome, uint256 finalApyBps)[]
+        // Each tuple is 3 × 32 = 96 bytes.
+        if (report.length == 0 || report.length % 96 != 0) revert InvalidReportLength();
+
+        uint256 count = report.length / 96;
+        for (uint256 i = 0; i < count; i++) {
+            (uint256 marketId, uint8 rawOutcome, uint256 finalApyBps) =
+                abi.decode(report[i * 96:(i + 1) * 96], (uint256, uint8, uint256));
+
+            Outcome outcome = Outcome(rawOutcome);
+            emit SettlementReportReceived(marketId, outcome, finalApyBps);
+
+            // Silently skip invalid entries rather than reverting the entire batch.
+            if (marketId >= nextMarketId) continue;
+            if (markets[marketId].settled) continue;
+            if (outcome != Outcome.YES && outcome != Outcome.NO) continue;
+
+            _settle(marketId, outcome, finalApyBps);
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    //  Settlement — legacy direct call
+    // ──────────────────────────────────────────────
+
+    /// @notice Settle a market directly. Only callable by the authorised CRE settler address.
+    ///         Kept for backward compatibility and simpler testing.
     /// @param _marketId The market to settle.
     /// @param _outcome 1 for YES, 2 for NO.
     /// @param _finalApyBps The final APY observed, in basis points.
@@ -330,15 +380,10 @@ contract DestakerMarket {
         Outcome _outcome,
         uint256 _finalApyBps
     ) external onlySettler marketExists(_marketId) {
-        Market storage m = markets[_marketId];
-        if (m.settled) revert MarketAlreadySettled();
+        if (markets[_marketId].settled) revert MarketAlreadySettled();
         if (_outcome != Outcome.YES && _outcome != Outcome.NO) revert InvalidOutcome();
 
-        m.settled = true;
-        m.outcome = _outcome;
-        m.finalApyBps = _finalApyBps;
-
-        emit MarketSettled(_marketId, _outcome, _finalApyBps);
+        _settle(_marketId, _outcome, _finalApyBps);
     }
 
     // ──────────────────────────────────────────────
@@ -463,6 +508,15 @@ contract DestakerMarket {
     // ──────────────────────────────────────────────
     //  Internal helpers
     // ──────────────────────────────────────────────
+
+    /// @dev Core settlement logic shared by onReport() and settleMarket().
+    function _settle(uint256 _marketId, Outcome _outcome, uint256 _finalApyBps) internal {
+        Market storage m = markets[_marketId];
+        m.settled = true;
+        m.outcome = _outcome;
+        m.finalApyBps = _finalApyBps;
+        emit MarketSettled(_marketId, _outcome, _finalApyBps);
+    }
 
     function _pullUSDC(address _from, uint256 _amount) internal {
         bool ok = usdc.transferFrom(_from, address(this), _amount);
