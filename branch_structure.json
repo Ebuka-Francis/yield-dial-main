@@ -1,0 +1,21 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "contract",
+    "ebuka/mobile-connect",
+    "ebuka/wallet-connect",
+    "main"
+  ],
+  "parent": {
+    "contract": "main",
+    "ebuka/mobile-connect": "main",
+    "ebuka/wallet-connect": "main",
+    "main": null
+  },
+  "order": [
+    "main",
+    "contract",
+    "ebuka/mobile-connect",
+    "ebuka/wallet-connect"
+  ]
+}
