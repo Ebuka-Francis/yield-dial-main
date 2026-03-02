@@ -2,6 +2,14 @@
   "schedule": "0 */30 * * * *",
   "defillamaApiUrl": "https://yields.llama.fi/pools",
   "geminiModel": "gemini-2.5-flash-lite",
+  "geminiEndpoint": "https://ai.gateway.lovable.dev/v1/chat/completions",
+  "gasLimit": "500000",
+  "evms": [
+    {
+      "chainSelectorName": "ethereum-testnet-sepolia",
+      "contractAddress": "0x0000000000000000000000000000000000000000"
+    }
+  ],
   "markets": [
     { "id": "001", "asset": "stETH", "threshold": 3.5, "settlementDate": "2026-02-28" },
     { "id": "002", "asset": "rETH", "threshold": 3.2, "settlementDate": "2026-03-01" },

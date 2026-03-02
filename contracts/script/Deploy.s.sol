@@ -21,6 +21,8 @@ contract DeployDestaker is Script {
     function run() external {
         uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address settler = vm.envAddress("SETTLER_ADDRESS");
+        // Chainlink Forwarder address for CRE on-chain writes (set to address(0) to skip).
+        address forwarder = vm.envOr("FORWARDER_ADDRESS", address(0));
 
         vm.startBroadcast(deployerKey);
 
@@ -32,6 +34,11 @@ contract DeployDestaker is Script {
             GROUP_ID,
             settler
         );
+
+        if (forwarder != address(0)) {
+            market.setForwarder(forwarder);
+            console.log("Forwarder set to:", forwarder);
+        }
 
         console.log("DestakerMarket deployed at:", address(market));
 
