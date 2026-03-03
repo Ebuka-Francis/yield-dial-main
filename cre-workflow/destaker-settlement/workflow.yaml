@@ -11,5 +11,7 @@ staging-settings:
 production-settings:
   user-workflow:
     workflow-name: "destaker-settlement"
-    workflow-artifacts:
+  workflow-artifacts:
       workflow-path: "./main.ts"
+      config-path: "./config.production.json"
+      secrets-path: ""
