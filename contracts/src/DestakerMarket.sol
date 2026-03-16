@@ -1,37 +1,53 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {IWorldID} from "./interfaces/IWorldID.sol";
-import {IReceiver} from "./interfaces/IReceiver.sol";
-
 /// @title DestakerMarket
-/// @notice Sybil-resistant yield prediction markets settled by Chainlink CRE workflows.
-/// @dev Users buy YES/NO outcome shares with USDC. Markets are settled either by:
-///      (a) an authorised CRE settler address calling settleMarket() directly, or
-///      (b) the Chainlink Forwarder delivering a DON-signed report via onReport().
-///      Winners redeem shares pro-rata for USDC. World ID verification prevents Sybil abuse.
-contract DestakerMarket is IReceiver {
+/// @notice Decentralized yield prediction markets settled by a trusted oracle or admin.
+/// @dev Users place bets on YES/NO outcomes with a stablecoin. Markets are created by
+///      an authorized admin, settled by a trusted settler address that posts the final
+///      APY and outcome. Winners claim rewards pro-rata from the total pool.
+contract DestakerMarket {
+
     // ──────────────────────────────────────────────
     //  Types
     // ──────────────────────────────────────────────
 
+    enum MarketStatus {
+        OPEN,       // 0 — accepting bets
+        CLOSED,     // 1 — no longer accepting bets, awaiting settlement
+        SETTLED     // 2 — outcome determined, claims open
+    }
+
     enum Outcome {
         UNRESOLVED, // 0
-        YES,        // 1
-        NO          // 2
+        YES,        // 1 — final APY stayed above threshold
+        NO          // 2 — final APY fell below threshold
     }
 
     struct Market {
-        string asset;           // e.g. "stETH"
-        uint256 thresholdBps;   // basis points — 350 = 3.50%
-        uint256 settlementDate; // unix timestamp
-        bool settled;
-        Outcome outcome;
-        uint256 finalApyBps;    // final APY in bps written by CRE
-        uint256 totalYesShares;
-        uint256 totalNoShares;
-        uint256 totalCollateral; // total USDC deposited
-        uint256 createdAt;
+        uint256 marketId;
+        string asset;            // e.g. "stETH"
+        uint256 thresholdBps;    // APY threshold in basis points — 350 = 3.50%
+        uint256 startTime;       // unix timestamp — when betting opens
+        uint256 endTime;         // unix timestamp — when betting closes
+        uint256 settlementTime;  // unix timestamp — when market can be settled
+        address token;           // stablecoin used for trading (e.g. USDC)
+        uint256 totalYesShares;  // total liquidity on YES side
+        uint256 totalNoShares;   // total liquidity on NO side
+        MarketStatus status;     // open / closed / settled
+        Outcome outcome;         // final outcome after settlement
+        uint256 finalApyBps;     // final APY in bps written by settler
+        uint256 totalCollateral; // total tokens deposited
+        uint256 createdAt;       // block timestamp at creation
+        uint256 settledAt;       // block timestamp at settlement
+    }
+
+    struct Position {
+        address user;
+        uint256 marketId;
+        Outcome side;
+        uint256 amount;
+        bool claimed;
     }
 
     // ──────────────────────────────────────────────
@@ -46,29 +62,14 @@ contract DestakerMarket is IReceiver {
     //  State
     // ──────────────────────────────────────────────
 
-    /// @notice USDC token used as collateral (set once in constructor).
-    IERC20 public immutable usdc;
-
-    /// @notice World ID on-chain verifier contract.
-    IWorldID public immutable worldId;
-
-    /// @notice World ID app id hash — `abi.encodePacked("app_...", "/", "destaker-verify")`.
-    uint256 public immutable externalNullifierHash;
-
-    /// @notice World ID group id (1 = Orb, 0 = Device).
-    uint256 public immutable groupId;
-
-    /// @notice Contract owner (can create markets & set settler).
+    /// @notice Contract owner — can create markets, set settler, withdraw fees.
     address public owner;
 
-    /// @notice Address authorised to settle markets (the CRE workflow DON address).
+    /// @notice Address authorised to settle markets (oracle or trusted admin).
     address public settler;
 
-    /// @notice Chainlink Forwarder contract that delivers DON-signed reports.
-    address public forwarder;
-
-    /// @notice Accumulated protocol fees (in USDC).
-    uint256 public accumulatedFees;
+    /// @notice Accumulated protocol fees per token.
+    mapping(address => uint256) public accumulatedFees;
 
     /// @notice Market id counter.
     uint256 public nextMarketId;
@@ -82,48 +83,57 @@ contract DestakerMarket is IReceiver {
     /// @notice market id → user → NO shares.
     mapping(uint256 => mapping(address => uint256)) public noShares;
 
-    /// @notice market id → user → whether they already claimed.
+    /// @notice market id → user → whether they already claimed reward.
     mapping(uint256 => mapping(address => bool)) public claimed;
 
-    /// @notice nullifier hash → bool — prevents double-verification.
-    mapping(uint256 => bool) public nullifierHashes;
-
-    /// @notice address → bool — whether the address passed World ID verification.
-    mapping(address => bool) public verifiedHumans;
-
     // ──────────────────────────────────────────────
-    //  LP state (simplified constant-product)
+    //  LP state
     // ──────────────────────────────────────────────
 
-    /// @notice market id → total LP USDC deposited.
+    /// @notice market id → total LP tokens deposited.
     mapping(uint256 => uint256) public lpPool;
 
-    /// @notice market id → user → LP deposit amount.
-    mapping(uint256 => mapping(address => uint256)) public lpDeposits;
-
-    /// @notice market id → total LP shares.
+    /// @notice market id → total LP shares issued.
     mapping(uint256 => uint256) public lpTotalShares;
 
-    /// @notice market id → user → LP shares.
+    /// @notice market id → user → LP shares held.
     mapping(uint256 => mapping(address => uint256)) public lpUserShares;
 
-    /// @notice market id → accumulated fees for LPs.
+    /// @notice market id → accumulated LP fees.
     mapping(uint256 => uint256) public lpFees;
 
     // ──────────────────────────────────────────────
     //  Events
     // ──────────────────────────────────────────────
 
-    event MarketCreated(uint256 indexed marketId, string asset, uint256 thresholdBps, uint256 settlementDate);
-    event SharesPurchased(uint256 indexed marketId, address indexed buyer, Outcome side, uint256 usdcAmount, uint256 shares);
-    event MarketSettled(uint256 indexed marketId, Outcome outcome, uint256 finalApyBps);
-    event Claimed(uint256 indexed marketId, address indexed user, uint256 payout);
-    event HumanVerified(address indexed user, uint256 nullifierHash);
+    event MarketCreated(
+        uint256 indexed marketId,
+        string asset,
+        uint256 thresholdBps,
+        uint256 startTime,
+        uint256 endTime,
+        uint256 settlementTime,
+        address token
+    );
+    event BetPlaced(
+        uint256 indexed marketId,
+        address indexed user,
+        Outcome side,
+        uint256 amount,
+        uint256 shares
+    );
+    event MarketClosed(uint256 indexed marketId);
+    event MarketSettled(
+        uint256 indexed marketId,
+        Outcome outcome,
+        uint256 finalApyBps,
+        uint256 settledAt
+    );
+    event RewardClaimed(uint256 indexed marketId, address indexed user, uint256 payout);
     event LiquidityAdded(uint256 indexed marketId, address indexed provider, uint256 amount, uint256 lpShares);
     event LiquidityRemoved(uint256 indexed marketId, address indexed provider, uint256 amount, uint256 lpShares);
     event SettlerUpdated(address indexed oldSettler, address indexed newSettler);
-    event ForwarderUpdated(address indexed oldForwarder, address indexed newForwarder);
-    event SettlementReportReceived(uint256 indexed marketId, Outcome outcome, uint256 finalApyBps);
+    event FeesWithdrawn(address indexed token, address indexed to, uint256 amount);
 
     // ──────────────────────────────────────────────
     //  Errors
@@ -131,17 +141,16 @@ contract DestakerMarket is IReceiver {
 
     error Unauthorized();
     error MarketNotFound();
-    error MarketAlreadySettled();
+    error MarketNotOpen();
+    error MarketNotClosed();
     error MarketNotSettled();
+    error MarketAlreadySettled();
     error InvalidOutcome();
     error InvalidAmount();
-    error NotVerifiedHuman();
+    error InvalidTimestamp();
     error AlreadyClaimed();
     error NothingToClaim();
-    error InvalidNullifier();
     error TransferFailed();
-    error InvalidForwarder();
-    error InvalidReportLength();
 
     // ──────────────────────────────────────────────
     //  Modifiers
@@ -157,11 +166,6 @@ contract DestakerMarket is IReceiver {
         _;
     }
 
-    modifier onlyVerified() {
-        if (!verifiedHumans[msg.sender]) revert NotVerifiedHuman();
-        _;
-    }
-
     modifier marketExists(uint256 _marketId) {
         if (_marketId >= nextMarketId) revert MarketNotFound();
         _;
@@ -171,31 +175,10 @@ contract DestakerMarket is IReceiver {
     //  Constructor
     // ──────────────────────────────────────────────
 
-    /// @param _usdc USDC token address.
-    /// @param _worldId World ID Router contract address.
-    /// @param _appId The World ID app id string, e.g. "app_135f61bfd908558b3c07fd6580d58192".
-    /// @param _actionId The action identifier string, e.g. "destaker-verify".
-    /// @param _groupId 1 for Orb, 0 for Device.
-    /// @param _settler Initial CRE settler address.
-    constructor(
-        address _usdc,
-        address _worldId,
-        string memory _appId,
-        string memory _actionId,
-        uint256 _groupId,
-        address _settler
-    ) {
+    /// @param _settler Initial settler address (oracle or trusted admin).
+    constructor(address _settler) {
         owner = msg.sender;
-        usdc = IERC20(_usdc);
-        worldId = IWorldID(_worldId);
-        groupId = _groupId;
         settler = _settler;
-
-        // Compute external nullifier hash the same way the World ID SDK does:
-        //   hash(hash(appId) + actionId)
-        externalNullifierHash = uint256(
-            keccak256(abi.encodePacked(uint256(keccak256(abi.encodePacked(_appId))), _actionId))
-        );
     }
 
     // ──────────────────────────────────────────────
@@ -207,117 +190,114 @@ contract DestakerMarket is IReceiver {
         owner = _newOwner;
     }
 
-    /// @notice Update the CRE settler address.
+    /// @notice Update the settler address.
     function setSettler(address _settler) external onlyOwner {
         emit SettlerUpdated(settler, _settler);
         settler = _settler;
     }
 
-    /// @notice Update the Chainlink Forwarder address.
-    function setForwarder(address _forwarder) external onlyOwner {
-        emit ForwarderUpdated(forwarder, _forwarder);
-        forwarder = _forwarder;
+    /// @notice Withdraw accumulated protocol fees for a given token.
+    function withdrawFees(address _token, address _to) external onlyOwner {
+        uint256 amount = accumulatedFees[_token];
+        accumulatedFees[_token] = 0;
+        _transferToken(_token, _to, amount);
+        emit FeesWithdrawn(_token, _to, amount);
     }
 
-    /// @notice Withdraw accumulated protocol fees.
-    function withdrawFees(address _to) external onlyOwner {
-        uint256 amount = accumulatedFees;
-        accumulatedFees = 0;
-        _transferUSDC(_to, amount);
-    }
-
-    // ──────────────────────────────────────────────
-    //  World ID verification
-    // ──────────────────────────────────────────────
-
-    /// @notice Verify a user's World ID proof on-chain. After verification the user is
-    ///         marked as a verified human and can trade on all markets.
-    /// @param root The Merkle tree root from IDKit.
-    /// @param nullifierHash The nullifier hash from IDKit.
-    /// @param proof The ZK proof (8 elements) from IDKit.
-    function verifyAndRegister(
-        uint256 root,
-        uint256 nullifierHash,
-        uint256[8] calldata proof
-    ) external {
-        // Prevent double-verification with the same nullifier.
-        if (nullifierHashes[nullifierHash]) revert InvalidNullifier();
-
-        // Signal is the caller's address — ties the proof to this specific wallet.
-        uint256 signalHash = uint256(keccak256(abi.encodePacked(msg.sender)));
-
-        // Will revert if the proof is invalid.
-        worldId.verifyProof(root, groupId, signalHash, nullifierHash, externalNullifierHash, proof);
-
-        nullifierHashes[nullifierHash] = true;
-        verifiedHumans[msg.sender] = true;
-
-        emit HumanVerified(msg.sender, nullifierHash);
+    /// @notice Manually close a market (stop accepting bets).
+    ///         Can also be triggered automatically in placeBet() once endTime passes.
+    function closeMarket(uint256 _marketId) external onlyOwner marketExists(_marketId) {
+        Market storage m = markets[_marketId];
+        if (m.status != MarketStatus.OPEN) revert MarketNotOpen();
+        m.status = MarketStatus.CLOSED;
+        emit MarketClosed(_marketId);
     }
 
     // ──────────────────────────────────────────────
-    //  Market creation
+    //  Market Creation
     // ──────────────────────────────────────────────
 
     /// @notice Create a new yield prediction market.
-    /// @param _asset Display name, e.g. "stETH".
+    /// @param _asset Display name of tracked asset e.g. "stETH".
     /// @param _thresholdBps APY threshold in basis points (350 = 3.50%).
-    /// @param _settlementDate Unix timestamp when the market can be settled.
+    /// @param _startTime Unix timestamp when betting opens.
+    /// @param _endTime Unix timestamp when betting closes.
+    /// @param _settlementTime Unix timestamp when market can be settled (must be >= endTime).
+    /// @param _token Stablecoin token address used for trading.
     /// @return marketId The newly created market's id.
     function createMarket(
         string calldata _asset,
         uint256 _thresholdBps,
-        uint256 _settlementDate
+        uint256 _startTime,
+        uint256 _endTime,
+        uint256 _settlementTime,
+        address _token
     ) external onlyOwner returns (uint256 marketId) {
+        if (_startTime >= _endTime) revert InvalidTimestamp();
+        if (_settlementTime < _endTime) revert InvalidTimestamp();
+        if (_token == address(0)) revert InvalidAmount();
+
         marketId = nextMarketId++;
+
         markets[marketId] = Market({
+            marketId: marketId,
             asset: _asset,
             thresholdBps: _thresholdBps,
-            settlementDate: _settlementDate,
-            settled: false,
-            outcome: Outcome.UNRESOLVED,
-            finalApyBps: 0,
+            startTime: _startTime,
+            endTime: _endTime,
+            settlementTime: _settlementTime,
+            token: _token,
             totalYesShares: 0,
             totalNoShares: 0,
+            status: MarketStatus.OPEN,
+            outcome: Outcome.UNRESOLVED,
+            finalApyBps: 0,
             totalCollateral: 0,
-            createdAt: block.timestamp
+            createdAt: block.timestamp,
+            settledAt: 0
         });
-        emit MarketCreated(marketId, _asset, _thresholdBps, _settlementDate);
+
+        emit MarketCreated(marketId, _asset, _thresholdBps, _startTime, _endTime, _settlementTime, _token);
     }
 
     // ──────────────────────────────────────────────
-    //  Trading
+    //  Place Bet
     // ──────────────────────────────────────────────
 
-    /// @notice Buy YES or NO shares with USDC. Shares are minted 1:1 minus the fee.
-    ///         e.g. deposit 100 USDC → 1.5 USDC fee → 98.5 shares minted.
-    /// @param _marketId The market to trade on.
+    /// @notice Place a bet on YES or NO outcome.
+    /// @param _marketId The market to bet on.
     /// @param _side Outcome.YES (1) or Outcome.NO (2).
-    /// @param _usdcAmount Amount of USDC to spend.
-    function buyShares(
+    /// @param _amount Amount of tokens to deposit.
+    function placeBet(
         uint256 _marketId,
         Outcome _side,
-        uint256 _usdcAmount
-    ) external onlyVerified marketExists(_marketId) {
+        uint256 _amount
+    ) external marketExists(_marketId) {
         Market storage m = markets[_marketId];
-        if (m.settled) revert MarketAlreadySettled();
+
+        // Auto-close market if endTime has passed.
+        if (block.timestamp >= m.endTime && m.status == MarketStatus.OPEN) {
+            m.status = MarketStatus.CLOSED;
+            emit MarketClosed(_marketId);
+        }
+
+        if (m.status != MarketStatus.OPEN) revert MarketNotOpen();
         if (_side != Outcome.YES && _side != Outcome.NO) revert InvalidOutcome();
-        if (_usdcAmount == 0) revert InvalidAmount();
+        if (_amount == 0) revert InvalidAmount();
 
-        // Pull USDC from user.
-        _pullUSDC(msg.sender, _usdcAmount);
+        // Pull tokens from user.
+        _pullToken(m.token, msg.sender, _amount);
 
-        // Deduct fee.
-        uint256 fee = (_usdcAmount * FEE_BPS) / BPS;
-        uint256 netAmount = _usdcAmount - fee;
-
-        // Split fees: 50% protocol, 50% LP pool.
+        // Deduct fee — split 50% protocol, 50% LP pool.
+        uint256 fee = (_amount * FEE_BPS) / BPS;
+        uint256 netAmount = _amount - fee;
         uint256 protocolFee = fee / 2;
         uint256 lpFee = fee - protocolFee;
-        accumulatedFees += protocolFee;
+
+        accumulatedFees[m.token] += protocolFee;
         lpFees[_marketId] += lpFee;
 
-        // Mint shares 1:1 with net USDC.
+        // Record position — shares minted 1:1 with net amount.
         if (_side == Outcome.YES) {
             yesShares[_marketId][msg.sender] += netAmount;
             m.totalYesShares += netAmount;
@@ -328,74 +308,102 @@ contract DestakerMarket is IReceiver {
 
         m.totalCollateral += netAmount;
 
-        emit SharesPurchased(_marketId, msg.sender, _side, _usdcAmount, netAmount);
+        emit BetPlaced(_marketId, msg.sender, _side, _amount, netAmount);
     }
 
     // ──────────────────────────────────────────────
-    //  CRE Settlement — IReceiver (production path)
+    //  Liquidity Provision
     // ──────────────────────────────────────────────
 
-    /// @notice Called by the Chainlink Forwarder to deliver a DON-signed settlement report.
-    ///         The report is ABI-encoded as a batch of (uint256 marketId, uint8 outcome, uint256 finalApyBps)
-    ///         tuples produced by runtime.report() in the CRE TypeScript workflow.
-    /// @param metadata Workflow metadata (ignored for now — can be used for workflow ID validation).
-    /// @param report   ABI-encoded settlement payload.
-    function onReport(bytes calldata metadata, bytes calldata report) external override {
-        if (msg.sender != forwarder) revert InvalidForwarder();
-        // Silence unused-parameter warning; metadata can be validated in a future version.
-        metadata;
+    /// @notice Provide liquidity to a market. LPs earn a share of trading fees.
+    /// @param _marketId The market to provide liquidity for.
+    /// @param _amount Token amount to deposit.
+    function provideLiquidity(uint256 _marketId, uint256 _amount) external marketExists(_marketId) {
+        Market storage m = markets[_marketId];
+        if (m.status != MarketStatus.OPEN) revert MarketNotOpen();
+        if (_amount == 0) revert InvalidAmount();
 
-        // Decode a batch of settlements: (uint256 marketId, uint8 outcome, uint256 finalApyBps)[]
-        // Each tuple is 3 × 32 = 96 bytes.
-        if (report.length == 0 || report.length % 96 != 0) revert InvalidReportLength();
+        _pullToken(m.token, msg.sender, _amount);
 
-        uint256 count = report.length / 96;
-        for (uint256 i = 0; i < count; i++) {
-            (uint256 marketId, uint8 rawOutcome, uint256 finalApyBps) =
-                abi.decode(report[i * 96:(i + 1) * 96], (uint256, uint8, uint256));
-
-            Outcome outcome = Outcome(rawOutcome);
-            emit SettlementReportReceived(marketId, outcome, finalApyBps);
-
-            // Silently skip invalid entries rather than reverting the entire batch.
-            if (marketId >= nextMarketId) continue;
-            if (markets[marketId].settled) continue;
-            if (outcome != Outcome.YES && outcome != Outcome.NO) continue;
-
-            _settle(marketId, outcome, finalApyBps);
+        // Mint LP shares proportional to contribution.
+        uint256 shares;
+        if (lpTotalShares[_marketId] == 0) {
+            shares = _amount;
+        } else {
+            shares = (_amount * lpTotalShares[_marketId]) / lpPool[_marketId];
         }
+
+        lpPool[_marketId] += _amount;
+        lpTotalShares[_marketId] += shares;
+        lpUserShares[_marketId][msg.sender] += shares;
+
+        emit LiquidityAdded(_marketId, msg.sender, _amount, shares);
+    }
+
+    /// @notice Remove liquidity and collect earned fees.
+    /// @param _marketId The market to withdraw from.
+    /// @param _shares LP shares to redeem.
+    function removeLiquidity(uint256 _marketId, uint256 _shares) external marketExists(_marketId) {
+        if (_shares == 0 || _shares > lpUserShares[_marketId][msg.sender]) revert InvalidAmount();
+
+        uint256 totalValue = lpPool[_marketId] + lpFees[_marketId];
+        uint256 payout = (_shares * totalValue) / lpTotalShares[_marketId];
+
+        lpUserShares[_marketId][msg.sender] -= _shares;
+        lpTotalShares[_marketId] -= _shares;
+
+        if (payout <= lpPool[_marketId]) {
+            lpPool[_marketId] -= payout;
+        } else {
+            uint256 fromFees = payout - lpPool[_marketId];
+            lpPool[_marketId] = 0;
+            lpFees[_marketId] -= fromFees;
+        }
+
+        _transferToken(markets[_marketId].token, msg.sender, payout);
+
+        emit LiquidityRemoved(_marketId, msg.sender, payout, _shares);
     }
 
     // ──────────────────────────────────────────────
-    //  Settlement — legacy direct call
+    //  Market Settlement
     // ──────────────────────────────────────────────
 
-    /// @notice Settle a market directly. Only callable by the authorised CRE settler address.
-    ///         Kept for backward compatibility and simpler testing.
+    /// @notice Settle a market with the final APY value.
+    ///         Only callable by the authorised settler address.
+    ///         The settler fetches the real APY off-chain and posts it here.
     /// @param _marketId The market to settle.
-    /// @param _outcome 1 for YES, 2 for NO.
-    /// @param _finalApyBps The final APY observed, in basis points.
+    /// @param _finalApyBps The observed final APY in basis points.
     function settleMarket(
         uint256 _marketId,
-        Outcome _outcome,
         uint256 _finalApyBps
     ) external onlySettler marketExists(_marketId) {
-        if (markets[_marketId].settled) revert MarketAlreadySettled();
-        if (_outcome != Outcome.YES && _outcome != Outcome.NO) revert InvalidOutcome();
+        Market storage m = markets[_marketId];
 
-        _settle(_marketId, _outcome, _finalApyBps);
+        if (m.status == MarketStatus.SETTLED) revert MarketAlreadySettled();
+        if (block.timestamp < m.settlementTime) revert MarketNotClosed();
+
+        // Determine outcome by comparing final APY to threshold.
+        Outcome outcome = _finalApyBps >= m.thresholdBps ? Outcome.YES : Outcome.NO;
+
+        m.status = MarketStatus.SETTLED;
+        m.outcome = outcome;
+        m.finalApyBps = _finalApyBps;
+        m.settledAt = block.timestamp;
+
+        emit MarketSettled(_marketId, outcome, _finalApyBps, block.timestamp);
     }
 
     // ──────────────────────────────────────────────
-    //  Claims
+    //  Reward Distribution
     // ──────────────────────────────────────────────
 
-    /// @notice Claim winnings after a market has settled. Winning shares are redeemed
-    ///         pro-rata from the total collateral pool (winners split the losers' collateral).
-    /// @param _marketId The settled market.
-    function claim(uint256 _marketId) external marketExists(_marketId) {
+    /// @notice Claim reward after market settlement.
+    ///         Winners receive a pro-rata share of the total collateral pool.
+    /// @param _marketId The settled market to claim from.
+    function claimReward(uint256 _marketId) external marketExists(_marketId) {
         Market storage m = markets[_marketId];
-        if (!m.settled) revert MarketNotSettled();
+        if (m.status != MarketStatus.SETTLED) revert MarketNotSettled();
         if (claimed[_marketId][msg.sender]) revert AlreadyClaimed();
 
         uint256 userShares;
@@ -413,77 +421,21 @@ contract DestakerMarket is IReceiver {
 
         claimed[_marketId][msg.sender] = true;
 
-        // Payout = user's share of total collateral.
-        // If nobody won (winningPool == 0 should not happen after settlement with valid outcome),
-        // but guard anyway.
-        uint256 payout;
+        // Payout = user's proportional share of total collateral pool.
+        uint256 payout = 0;
         if (winningPool > 0) {
             payout = (m.totalCollateral * userShares) / winningPool;
         }
 
         if (payout > 0) {
-            _transferUSDC(msg.sender, payout);
+            _transferToken(m.token, msg.sender, payout);
         }
 
-        emit Claimed(_marketId, msg.sender, payout);
+        emit RewardClaimed(_marketId, msg.sender, payout);
     }
 
     // ──────────────────────────────────────────────
-    //  Liquidity provision (simplified)
-    // ──────────────────────────────────────────────
-
-    /// @notice Add USDC liquidity to a market. LPs earn a share of trading fees.
-    /// @param _marketId The market to provide liquidity for.
-    /// @param _amount USDC amount to deposit.
-    function addLiquidity(uint256 _marketId, uint256 _amount) external onlyVerified marketExists(_marketId) {
-        if (_amount == 0) revert InvalidAmount();
-        if (markets[_marketId].settled) revert MarketAlreadySettled();
-
-        _pullUSDC(msg.sender, _amount);
-
-        uint256 shares;
-        if (lpTotalShares[_marketId] == 0) {
-            shares = _amount;
-        } else {
-            shares = (_amount * lpTotalShares[_marketId]) / lpPool[_marketId];
-        }
-
-        lpPool[_marketId] += _amount;
-        lpTotalShares[_marketId] += shares;
-        lpUserShares[_marketId][msg.sender] += shares;
-        lpDeposits[_marketId][msg.sender] += _amount;
-
-        emit LiquidityAdded(_marketId, msg.sender, _amount, shares);
-    }
-
-    /// @notice Remove liquidity and collect earned fees.
-    /// @param _marketId The market to withdraw from.
-    /// @param _shares LP shares to redeem.
-    function removeLiquidity(uint256 _marketId, uint256 _shares) external marketExists(_marketId) {
-        if (_shares == 0 || _shares > lpUserShares[_marketId][msg.sender]) revert InvalidAmount();
-
-        uint256 totalValue = lpPool[_marketId] + lpFees[_marketId];
-        uint256 payout = (_shares * totalValue) / lpTotalShares[_marketId];
-
-        lpUserShares[_marketId][msg.sender] -= _shares;
-        lpTotalShares[_marketId] -= _shares;
-
-        // Deduct from pool + fees proportionally.
-        if (payout <= lpPool[_marketId]) {
-            lpPool[_marketId] -= payout;
-        } else {
-            uint256 fromFees = payout - lpPool[_marketId];
-            lpPool[_marketId] = 0;
-            lpFees[_marketId] -= fromFees;
-        }
-
-        _transferUSDC(msg.sender, payout);
-
-        emit LiquidityRemoved(_marketId, msg.sender, payout, _shares);
-    }
-
-    // ──────────────────────────────────────────────
-    //  View helpers
+    //  View Helpers
     // ──────────────────────────────────────────────
 
     /// @notice Get full market data.
@@ -491,45 +443,60 @@ contract DestakerMarket is IReceiver {
         return markets[_marketId];
     }
 
-    /// @notice Get a user's positions in a market.
+    /// @notice Get a user's position in a market.
     function getPosition(uint256 _marketId, address _user)
         external
         view
         returns (uint256 yes, uint256 no, bool hasClaimed)
     {
-        return (yesShares[_marketId][_user], noShares[_marketId][_user], claimed[_marketId][_user]);
+        return (
+            yesShares[_marketId][_user],
+            noShares[_marketId][_user],
+            claimed[_marketId][_user]
+        );
     }
 
-    /// @notice Check if an address is a verified human.
-    function isVerifiedHuman(address _user) external view returns (bool) {
-        return verifiedHumans[_user];
+    /// @notice Get a user's LP share in a market.
+    function getLPPosition(uint256 _marketId, address _user)
+        external
+        view
+        returns (uint256 shares, uint256 totalShares, uint256 poolSize)
+    {
+        return (
+            lpUserShares[_marketId][_user],
+            lpTotalShares[_marketId],
+            lpPool[_marketId]
+        );
+    }
+
+    /// @notice Get current market status as a string (for UI convenience).
+    function getMarketStatus(uint256 _marketId) external view marketExists(_marketId) returns (string memory) {
+        MarketStatus status = markets[_marketId].status;
+        if (status == MarketStatus.OPEN) return "OPEN";
+        if (status == MarketStatus.CLOSED) return "CLOSED";
+        return "SETTLED";
     }
 
     // ──────────────────────────────────────────────
-    //  Internal helpers
+    //  Internal Helpers
     // ──────────────────────────────────────────────
 
-    /// @dev Core settlement logic shared by onReport() and settleMarket().
-    function _settle(uint256 _marketId, Outcome _outcome, uint256 _finalApyBps) internal {
-        Market storage m = markets[_marketId];
-        m.settled = true;
-        m.outcome = _outcome;
-        m.finalApyBps = _finalApyBps;
-        emit MarketSettled(_marketId, _outcome, _finalApyBps);
-    }
-
-    function _pullUSDC(address _from, uint256 _amount) internal {
-        bool ok = usdc.transferFrom(_from, address(this), _amount);
+    function _pullToken(address _token, address _from, uint256 _amount) internal {
+        bool ok = IERC20(_token).transferFrom(_from, address(this), _amount);
         if (!ok) revert TransferFailed();
     }
 
-    function _transferUSDC(address _to, uint256 _amount) internal {
-        bool ok = usdc.transfer(_to, _amount);
+    function _transferToken(address _token, address _to, uint256 _amount) internal {
+        bool ok = IERC20(_token).transfer(_to, _amount);
         if (!ok) revert TransferFailed();
     }
 }
 
-/// @notice Minimal ERC-20 interface (USDC).
+// ──────────────────────────────────────────────
+//  Interfaces
+// ──────────────────────────────────────────────
+
+/// @notice Minimal ERC-20 interface.
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
