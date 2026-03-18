@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.19;
 
 /// @title DestakerMarket
 /// @notice Decentralized yield prediction markets settled by a trusted oracle or admin.

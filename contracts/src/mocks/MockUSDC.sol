@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.19;
 
 /// @notice Simple ERC-20 mock for testnet. Anyone can mint.
 contract MockUSDC {
